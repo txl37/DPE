@@ -1,0 +1,12 @@
+# IDE
+.vs/
+.vscode/
+.cache/
+
+# output directory
+Build/
+
+# precompiled headers
+*.ipch
+*.gch
+*.pch
