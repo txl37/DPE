@@ -6,6 +6,10 @@ namespace app
         : m_name(std::move(name)), m_function(std::move(function))
     {
         m_fiber = CreateFiber(0, [](void* param) { reinterpret_cast<Fiber*>(param)->fiber_proc(); },this);
+        if (m_fiber == nullptr)
+        {
+            throw std::runtime_error("CreateFiber failed");
+        }
     }
 
     Fiber::~Fiber() 
@@ -64,7 +68,10 @@ namespace app
     {
         if (!IsThreadAFiber())
         {
-            ConvertThreadToFiber(nullptr);
+            if (ConvertThreadToFiber(nullptr) == nullptr)
+            {
+                throw std::runtime_error("ConvertThreadToFiber failed");
+            }
         }
     }
 

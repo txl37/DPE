@@ -36,7 +36,6 @@ namespace app
 
     class PageProtection;
     inline PageProtection* g_instance = nullptr;
-    inline bool g_bypass_veh = false;
     inline VirtualQueryFn g_original_virtual_query = nullptr;
     inline VirtualQueryExFn g_original_virtual_query_ex = nullptr;
 
@@ -46,67 +45,41 @@ namespace app
     class __declspec(code_seg(".prot")) PageProtection
     {
     private:
-        std::array<ProtectedSection, 8> m_protected_sections = {};
+        ProtectedSection m_protected_sections[8] = {};
         size_t m_protected_section_count = 0;
         size_t m_page_size = 4096;
         uintptr_t m_active_page_1 = 0;
         uintptr_t m_active_page_2 = 0;
-        std::array<std::uint8_t, 256> m_xor_key = {};
+        std::uint8_t m_xor_key[256] = {};
+        bool m_initialized = false;
         void* m_veh_handle = nullptr;
         SpinLock m_lock;
         size_t m_fault_count = 0;
         VirtualProtectFn m_virtual_protect = nullptr;
-
-        __declspec(safebuffers) bool set_secure_process_dacl()
-        {
-            PACL empty_dacl = nullptr;
-            empty_dacl = reinterpret_cast<PACL>(LocalAlloc(LPTR, sizeof(ACL)));
-            if (empty_dacl == nullptr)
-            {
-                return false;
-            }
-
-            if (!InitializeAcl(empty_dacl, sizeof(ACL), ACL_REVISION))
-            {
-                LocalFree(empty_dacl);
-                return false;
-            }
-
-            DWORD result = SetSecurityInfo(
-                GetCurrentProcess(),
-                SE_KERNEL_OBJECT,
-                DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
-                nullptr,
-                nullptr,
-                empty_dacl,
-                nullptr
-            );
-
-            LocalFree(empty_dacl);
-            return result == ERROR_SUCCESS;
-        }
-
-        __declspec(safebuffers) bool apply_process_mitigation_policies()
-        {
-            PROCESS_MITIGATION_BINARY_SIGNATURE_POLICY signature_policy = {};
-            signature_policy.MicrosoftSignedOnly = 1;
-
-            bool r1 = SetProcessMitigationPolicy(ProcessSignaturePolicy, &signature_policy, sizeof(signature_policy));
-
-            PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY extension_policy = {};
-            extension_policy.DisableExtensionPoints = 1;
-
-            bool r2 = SetProcessMitigationPolicy(ProcessExtensionPointDisablePolicy, &extension_policy, sizeof(extension_policy));
-
-            return r1 && r2;
-        }
 
         __declspec(safebuffers) void xor_page(uintptr_t page_addr)
         {
             std::uint8_t* ptr = reinterpret_cast<std::uint8_t*>(page_addr);
             for (size_t i = 0; i < m_page_size; ++i)
             {
-                ptr[i] ^= m_xor_key[i % m_xor_key.size()];
+                ptr[i] ^= m_xor_key[i % 256];
+            }
+        }
+
+        __declspec(safebuffers) void protect_page(uintptr_t page, DWORD protection)
+        {
+            DWORD previous = 0;
+            if (!m_virtual_protect(reinterpret_cast<void*>(page), m_page_size, protection, &previous))
+            {
+                __fastfail(FAST_FAIL_FATAL_APP_EXIT);
+            }
+        }
+
+        __declspec(safebuffers) void flush_page(uintptr_t page)
+        {
+            if (!FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(page), m_page_size))
+            {
+                __fastfail(FAST_FAIL_FATAL_APP_EXIT);
             }
         }
 
@@ -143,6 +116,10 @@ namespace app
 
                 if (check_name(cur_mod_view, module_name) || (cur_mod_view.ends_with(".dll") && check_name(cur_mod_view.substr(0, cur_mod_view.size() - 4), module_name)))
                 {
+                    if (import_desc->OriginalFirstThunk == 0)
+                    {
+                        return;
+                    }
                     IMAGE_THUNK_DATA* original_first_thunk = reinterpret_cast<IMAGE_THUNK_DATA*>(module_base + import_desc->OriginalFirstThunk);
                     IMAGE_THUNK_DATA* first_thunk = reinterpret_cast<IMAGE_THUNK_DATA*>(module_base + import_desc->FirstThunk);
 
@@ -161,11 +138,21 @@ namespace app
 
                         if (match)
                         {
-                            DWORD old_protect;
-                            m_virtual_protect(&first_thunk->u1.Function, sizeof(uintptr_t), PAGE_READWRITE, &old_protect);
+                            if (first_thunk->u1.Function == reinterpret_cast<uintptr_t>(hook_fn))
+                            {
+                                return;
+                            }
+                            DWORD old_protect = 0;
+                            if (!m_virtual_protect(&first_thunk->u1.Function, sizeof(uintptr_t), PAGE_READWRITE, &old_protect))
+                            {
+                                return;
+                            }
                             *original_fn = reinterpret_cast<void*>(first_thunk->u1.Function);
                             first_thunk->u1.Function = reinterpret_cast<uintptr_t>(hook_fn);
-                            m_virtual_protect(&first_thunk->u1.Function, sizeof(uintptr_t), old_protect, &old_protect);
+                            if (!m_virtual_protect(&first_thunk->u1.Function, sizeof(uintptr_t), old_protect, &old_protect))
+                            {
+                                __fastfail(FAST_FAIL_FATAL_APP_EXIT);
+                            }
                             return;
                         }
 
@@ -195,6 +182,10 @@ namespace app
 
         __declspec(safebuffers) bool is_in_protected_section(uintptr_t addr) const
         {
+            if (!m_initialized)
+            {
+                return false;
+            }
             for (size_t i = 0; i < m_protected_section_count; ++i)
             {
                 const auto& sec = m_protected_sections[i];
@@ -234,19 +225,18 @@ namespace app
 
             if (m_active_page_1 != 0 && m_active_page_2 != 0)
             {
-                DWORD old_protect;
-                m_virtual_protect(reinterpret_cast<LPVOID>(m_active_page_1), m_page_size, PAGE_READWRITE, &old_protect);
+                protect_page(m_active_page_1, PAGE_READWRITE);
                 xor_page(m_active_page_1);
-                m_virtual_protect(reinterpret_cast<LPVOID>(m_active_page_1), m_page_size, PAGE_NOACCESS, &old_protect);
+                protect_page(m_active_page_1, PAGE_NOACCESS);
 
                 m_active_page_1 = m_active_page_2;
                 m_active_page_2 = 0;
             }
 
-            DWORD old_protect;
-            m_virtual_protect(reinterpret_cast<LPVOID>(fault_page), m_page_size, PAGE_READWRITE, &old_protect);
+            protect_page(fault_page, PAGE_READWRITE);
             xor_page(fault_page);
-            m_virtual_protect(reinterpret_cast<LPVOID>(fault_page), m_page_size, PAGE_EXECUTE_READ, &old_protect);
+            protect_page(fault_page, PAGE_EXECUTE_READ);
+            flush_page(fault_page);
 
             if (m_active_page_1 == 0)
             {
@@ -263,13 +253,10 @@ namespace app
 
         __declspec(safebuffers) static LONG WINAPI vectored_exception_handler(EXCEPTION_POINTERS* exception_info)
         {
-            if (g_bypass_veh)
-            {
-                return EXCEPTION_CONTINUE_SEARCH;
-            }
-
             DWORD exception_code = exception_info->ExceptionRecord->ExceptionCode;
-            if (exception_code == STATUS_ACCESS_VIOLATION)
+            if (exception_code == STATUS_ACCESS_VIOLATION &&
+                exception_info->ExceptionRecord->NumberParameters >= 2 &&
+                exception_info->ExceptionRecord->ExceptionInformation[0] != 1)
             {
                 uintptr_t fault_addr = exception_info->ExceptionRecord->ExceptionInformation[1];
                 if (g_instance != nullptr && g_instance->is_in_protected_section(fault_addr))
@@ -281,24 +268,52 @@ namespace app
             return EXCEPTION_CONTINUE_SEARCH;
         }
 
-        __declspec(safebuffers) void read_encrypted_bytes(uintptr_t func_addr, std::array<std::uint8_t, 16>& out_bytes)
+        __declspec(safebuffers) bool read_encrypted_bytes(uintptr_t func_addr, std::array<std::uint8_t, 16>& out_bytes)
         {
-            uintptr_t page = func_addr - (func_addr % m_page_size);
-            g_bypass_veh = true;
-            DWORD old_protect;
-            m_virtual_protect(reinterpret_cast<LPVOID>(page), m_page_size, PAGE_READWRITE, &old_protect);
-            const std::uint8_t* src = reinterpret_cast<const std::uint8_t*>(func_addr);
-            for (size_t i = 0; i < out_bytes.size(); ++i)
+            if (!is_in_protected_section(func_addr) || func_addr > UINTPTR_MAX - 15 ||
+                !is_in_protected_section(func_addr + 15))
             {
-                out_bytes[i] = src[i];
+                return false;
             }
-            m_virtual_protect(reinterpret_cast<LPVOID>(page), m_page_size, PAGE_NOACCESS, &old_protect);
-            g_bypass_veh = false;
+            auto* output = out_bytes.data();
+            m_lock.lock();
+            for (size_t i = 0; i < 16;)
+            {
+                uintptr_t address = func_addr + i;
+                uintptr_t page = address - (address % m_page_size);
+                bool active = page == m_active_page_1 || page == m_active_page_2;
+                if (!active)
+                {
+                    protect_page(page, PAGE_READONLY);
+                }
+                do
+                {
+                    auto byte = *reinterpret_cast<const std::uint8_t*>(func_addr + i);
+                    output[i] = active ? byte ^ m_xor_key[(func_addr + i - page) % 256] : byte;
+                    ++i;
+                } while (i < 16 && func_addr + i - page < m_page_size);
+                if (!active)
+                {
+                    protect_page(page, PAGE_NOACCESS);
+                }
+            }
+            m_lock.unlock();
+            return true;
         }
 
-        __declspec(safebuffers) void initialize()
+        __declspec(safebuffers) bool initialize()
         {
+            if (m_initialized)
+            {
+                return true;
+            }
+            m_protected_section_count = 0;
+            m_fault_count = 0;
             m_virtual_protect = reinterpret_cast<VirtualProtectFn>(GetProcAddress(GetModuleHandleA("kernel32.dll"), "VirtualProtect"));
+            if (m_virtual_protect == nullptr)
+            {
+                return false;
+            }
 
             SYSTEM_INFO sys_info;
             GetSystemInfo(&sys_info);
@@ -316,16 +331,30 @@ namespace app
                 std::string_view name_view(sec_name.data());
                 if (name_view == ".text" || name_view.starts_with(".test_"))
                 {
-                    if (m_protected_section_count < m_protected_sections.size())
+                    if (section_header[i].Misc.VirtualSize == 0)
                     {
+                        continue;
+                    }
+                    if (m_protected_section_count < 8)
+                    {
+                        if (section_header[i].VirtualAddress % m_page_size != 0 ||
+                            nt_headers->OptionalHeader.SectionAlignment < m_page_size)
+                        {
+                            return false;
+                        }
                         m_protected_sections[m_protected_section_count].base_addr = module_base + section_header[i].VirtualAddress;
-                        m_protected_sections[m_protected_section_count].size = section_header[i].Misc.VirtualSize;
+                        m_protected_sections[m_protected_section_count].size =
+                            (static_cast<size_t>(section_header[i].Misc.VirtualSize) + m_page_size - 1) / m_page_size * m_page_size;
                         m_protected_section_count++;
+                    }
+                    else
+                    {
+                        return false;
                     }
                 }
             }
 
-            for (size_t i = 0; i < m_xor_key.size(); ++i)
+            for (size_t i = 0; i < 256; ++i)
             {
                 m_xor_key[i] = static_cast<uint8_t>((__rdtsc() ^ i) & 0xFF);
             }
@@ -333,10 +362,14 @@ namespace app
             g_original_virtual_query = reinterpret_cast<VirtualQueryFn>(GetProcAddress(GetModuleHandleA("kernel32.dll"), "VirtualQuery"));
             g_original_virtual_query_ex = reinterpret_cast<VirtualQueryExFn>(GetProcAddress(GetModuleHandleA("kernel32.dll"), "VirtualQueryEx"));
 
+            m_veh_handle = AddVectoredExceptionHandler(1, vectored_exception_handler);
+            if (m_veh_handle == nullptr)
+            {
+                return false;
+            }
             perform_iat_hook("kernel32", "VirtualQuery", reinterpret_cast<void*>(&hooked_virtual_query), reinterpret_cast<void**>(&g_original_virtual_query));
             perform_iat_hook("kernel32", "VirtualQueryEx", reinterpret_cast<void*>(&hooked_virtual_query_ex), reinterpret_cast<void**>(&g_original_virtual_query_ex));
-
-            m_veh_handle = AddVectoredExceptionHandler(1, vectored_exception_handler);
+            m_initialized = true;
 
             for (size_t i = 0; i < m_protected_section_count; ++i)
             {
@@ -347,20 +380,19 @@ namespace app
 
                 for (uintptr_t page = start_page; page < end_page; page += m_page_size)
                 {
-                    DWORD old_protect;
-                    m_virtual_protect(reinterpret_cast<LPVOID>(page), m_page_size, PAGE_READWRITE, &old_protect);
+                    protect_page(page, PAGE_READWRITE);
                     xor_page(page);
-                    m_virtual_protect(reinterpret_cast<LPVOID>(page), m_page_size, PAGE_NOACCESS, &old_protect);
+                    protect_page(page, PAGE_NOACCESS);
                 }
             }
+            return true;
         }
 
         __declspec(safebuffers) void shutdown()
         {
-            if (m_veh_handle != nullptr)
+            if (!m_initialized)
             {
-                RemoveVectoredExceptionHandler(m_veh_handle);
-                m_veh_handle = nullptr;
+                return;
             }
 
             for (size_t i = 0; i < m_protected_section_count; ++i)
@@ -372,8 +404,7 @@ namespace app
 
                 for (uintptr_t page = start_page; page < end_page; page += m_page_size)
                 {
-                    DWORD old_protect;
-                    m_virtual_protect(reinterpret_cast<LPVOID>(page), m_page_size, PAGE_READWRITE, &old_protect);
+                    protect_page(page, PAGE_READWRITE);
                     if (page == m_active_page_1 || page == m_active_page_2)
                     {
                         if (page == m_active_page_1) m_active_page_1 = 0;
@@ -383,8 +414,19 @@ namespace app
                     {
                         xor_page(page);
                     }
-                    m_virtual_protect(reinterpret_cast<LPVOID>(page), m_page_size, PAGE_EXECUTE_READ, &old_protect);
+                    protect_page(page, PAGE_EXECUTE_READ);
+                    flush_page(page);
                 }
+            }
+            m_initialized = false;
+            m_protected_section_count = 0;
+            void* previous = nullptr;
+            perform_iat_hook("kernel32", "VirtualQuery", reinterpret_cast<void*>(g_original_virtual_query), &previous);
+            perform_iat_hook("kernel32", "VirtualQueryEx", reinterpret_cast<void*>(g_original_virtual_query_ex), &previous);
+            if (m_veh_handle != nullptr)
+            {
+                RemoveVectoredExceptionHandler(m_veh_handle);
+                m_veh_handle = nullptr;
             }
         }
     };
@@ -408,7 +450,8 @@ namespace app
     __declspec(safebuffers) inline SIZE_T WINAPI hooked_virtual_query_ex(HANDLE process, LPCVOID address, PMEMORY_BASIC_INFORMATION buffer, SIZE_T length)
     {
         SIZE_T res = g_original_virtual_query_ex(process, address, buffer, length);
-        if (res != 0 && buffer != nullptr && g_instance != nullptr)
+        if (res != 0 && buffer != nullptr && g_instance != nullptr &&
+            GetProcessId(process) == GetCurrentProcessId())
         {
             uintptr_t addr = reinterpret_cast<uintptr_t>(address);
             if (g_instance->is_in_protected_section(addr))

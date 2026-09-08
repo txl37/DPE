@@ -1,5 +1,7 @@
 #pragma once
-// C++ Headers
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <aclapi.h>
 #include <shlobj.h>
@@ -10,7 +12,15 @@
 #include <d3d11.h>
 #include <wrl/client.h>
 #include <d3dcompiler.h>
-// Other
+#include <chrono>
+#include <concepts>
+#include <format>
+#include <memory>
+#include <optional>
+#include <sstream>
+#include <string_view>
+#include <thread>
+#include <unordered_map>
 #include <cstdint>
 #include <type_traits>
 #include <string>
@@ -30,7 +40,6 @@
 #include <algorithm>
 #include <typeindex>
 #define APP "DPE POC"
-//SDK
 #include "SDK/Types.h"
 #include "SDK/Util/Util.h"
 #include "SDK/Util/Cmd.h"
@@ -39,7 +48,7 @@
 #include "SDK/Fibers/Manager.h"
 #include "SDK/Fibers/Queue.h"
 
-namespace app // Global namespace
+namespace app
 {
 
 }

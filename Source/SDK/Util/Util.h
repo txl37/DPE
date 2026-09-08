@@ -58,8 +58,8 @@ namespace app::util
 	template <typename callable>
 	void do_timed(const std::string& id, DWORD delay, callable&& action)
 	{
-		static std::unordered_map<std::string, DWORD> m_next_execution_times;
-		DWORD current_time = GetTickCount();
+		static std::unordered_map<std::string, ULONGLONG> m_next_execution_times;
+		ULONGLONG current_time = GetTickCount64();
 
 		if (m_next_execution_times.find(id) == m_next_execution_times.end() ||
 			current_time >= m_next_execution_times[id]) {
@@ -113,4 +113,3 @@ namespace app::util
         static std::once_flag CONCAT(_once_flag_, __LINE__); \
         std::call_once(CONCAT(_once_flag_, __LINE__), block); \
     } while (0)
-

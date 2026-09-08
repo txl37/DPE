@@ -73,7 +73,7 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <IncludePath>$(SolutionDir)Include\;$(SolutionDir)Source;$(IncludePath)</IncludePath>
     <OutDir>$(SolutionDir)Build\Binaries\</OutDir>
-    <IntDir>$(SolutionDir)Build\Intermediate\</IntDir>
+    <IntDir>$(SolutionDir)Build\Intermediate\$(ProjectName)\$(Platform)\$(Configuration)\</IntDir>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
